@@ -1,3 +1,4 @@
+%%writefile fairseq/models/transformer.py
 # Copyright (c) Facebook, Inc. and its affiliates.
 #
 # This source code is licensed under the MIT license found in the
@@ -25,7 +26,6 @@ from fairseq.modules import (
     TransformerDecoderLayer,
     TransformerEncoderLayer,
 )
-import random
 
 DEFAULT_MAX_SOURCE_POSITIONS = 1024
 DEFAULT_MAX_TARGET_POSITIONS = 1024
@@ -36,14 +36,11 @@ class TransformerModel(FairseqEncoderDecoderModel):
     """
     Transformer model from `"Attention Is All You Need" (Vaswani, et al, 2017)
     <https://arxiv.org/abs/1706.03762>`_.
-
     Args:
         encoder (TransformerEncoder): the encoder
         decoder (TransformerDecoder): the decoder
-
     The Transformer model provides the following named architectures and
     command-line arguments:
-
     .. argparse::
         :ref: fairseq.models.transformer_parser
         :prog:
@@ -131,15 +128,14 @@ class TransformerModel(FairseqEncoderDecoderModel):
                             help='perform cross+self-attention')
         parser.add_argument('--layer-wise-attention', default=False, action='store_true',
                             help='perform layer-wise attention (cross-attention or cross+self-attention)')
-        # args for "Reducing Transformer Depth on Demand with Structured Dropout" (Fan et al., 2019)
-        parser.add_argument('--encoder-layerdrop', type=float, metavar='D', default=0,
-                            help='LayerDrop probability for encoder')
-        parser.add_argument('--decoder-layerdrop', type=float, metavar='D', default=0,
-                            help='LayerDrop probability for decoder')
-        parser.add_argument('--encoder-layers-to-keep', default=None,
-                            help='which layers to *keep* when pruning as a comma-separated list')
-        parser.add_argument('--decoder-layers-to-keep', default=None,
-                            help='which layers to *keep* when pruning as a comma-separated list')
+        parser.add_argument('--upgrade-src-dict', default=False, action='store_true',
+                            help='pass source embeddings for pretrained NMT model')
+        parser.add_argument('--upgrade-tgt-dict', default=False, action='store_true',
+                            help='pass target embeddings for pretrained NMT model')
+        parser.add_argument('--use-crosslingual-map', default=False, action='store_true',
+                            help='use crosslingual map trained using MUSE')
+        parser.add_argument('--crosslingual-map-path', type='str', metavar='STR',
+                            help='path to pretrained crosslingual map')
         # fmt: on
 
     @classmethod
@@ -148,11 +144,6 @@ class TransformerModel(FairseqEncoderDecoderModel):
 
         # make sure all arguments are present in older models
         base_architecture(args)
-
-        if args.encoder_layers_to_keep:
-            args.encoder_layers = len(args.encoder_layers_to_keep.split(","))
-        if args.decoder_layers_to_keep:
-            args.decoder_layers = len(args.decoder_layers_to_keep.split(","))
 
         if not hasattr(args, 'max_source_positions'):
             args.max_source_positions = DEFAULT_MAX_SOURCE_POSITIONS
@@ -278,7 +269,6 @@ class TransformerEncoder(FairseqEncoder):
     """
     Transformer encoder consisting of *args.encoder_layers* layers. Each layer
     is a :class:`TransformerEncoderLayer`.
-
     Args:
         args (argparse.Namespace): parsed command-line arguments
         dictionary (~fairseq.data.Dictionary): encoding dictionary
@@ -290,7 +280,6 @@ class TransformerEncoder(FairseqEncoder):
         self.register_buffer('version', torch.Tensor([3]))
 
         self.dropout = args.dropout
-        self.encoder_layerdrop = args.encoder_layerdrop
 
         embed_dim = embed_tokens.embedding_dim
         self.padding_idx = embed_tokens.padding_idx
@@ -316,7 +305,6 @@ class TransformerEncoder(FairseqEncoder):
         else:
             self.layer_norm = None
 
-
     def forward_embedding(self, src_tokens):
         # embed tokens and positions
         embed = self.embed_scale * self.embed_tokens(src_tokens)
@@ -334,7 +322,6 @@ class TransformerEncoder(FairseqEncoder):
                 shape `(batch)`
             return_all_hiddens (bool, optional): also return all of the
                 intermediate hidden states (default: False).
-
         Returns:
             dict:
                 - **encoder_out** (Tensor): the last encoder layer's output of
@@ -362,12 +349,9 @@ class TransformerEncoder(FairseqEncoder):
 
         # encoder layers
         for layer in self.layers:
-            # add LayerDrop (see https://arxiv.org/abs/1909.11556 for description)
-            dropout_probability = random.uniform(0, 1)
-            if not self.training or (dropout_probability > self.encoder_layerdrop):
-                x = layer(x, encoder_padding_mask)
-                if return_all_hiddens:
-                    encoder_states.append(x)
+            x = layer(x, encoder_padding_mask)
+            if return_all_hiddens:
+                encoder_states.append(x)
 
         if self.layer_norm:
             x = self.layer_norm(x)
@@ -384,11 +368,9 @@ class TransformerEncoder(FairseqEncoder):
     def reorder_encoder_out(self, encoder_out, new_order):
         """
         Reorder encoder output according to *new_order*.
-
         Args:
             encoder_out: output from the ``forward()`` method
             new_order (LongTensor): desired order
-
         Returns:
             *encoder_out* rearranged according to *new_order*
         """
@@ -418,16 +400,21 @@ class TransformerEncoder(FairseqEncoder):
         return self._future_mask[:dim, :dim]
 
     def upgrade_state_dict_named(self, state_dict, name):
+        # Keep the current weights for the encoder embedding table
+        if self.upgrade_src_dict:
+            for k in state_dict.keys():
+                if 'encoder.embed_tokens' in k:
+                    state_dict[k] = self.embed_tokens.weight
+                        if self.use_crosslingual_map:
+                            embed_map = torch.tensor(torch.load(self.crosslingual_map_path))#.to(torch.device('cuda:0'))
+                            state_dict[k] = torch.mm(self.embed_tokens.weight, embed_map)    
+
         """Upgrade a (possibly old) state dict for new versions of fairseq."""
         if isinstance(self.embed_positions, SinusoidalPositionalEmbedding):
             weights_key = '{}.embed_positions.weights'.format(name)
             if weights_key in state_dict:
                 del state_dict[weights_key]
             state_dict['{}.embed_positions._float_tensor'.format(name)] = torch.FloatTensor(1)
-        for i in range(len(self.layers)):
-            # update layer norms
-            self.layers[i].upgrade_state_dict_named(state_dict, "{}.layers.{}".format(name, i))
-
         version_key = '{}.version'.format(name)
         if utils.item(state_dict.get(version_key, torch.Tensor([1]))[0]) < 2:
             # earlier checkpoints did not normalize after the stack of layers
@@ -441,7 +428,6 @@ class TransformerDecoder(FairseqIncrementalDecoder):
     """
     Transformer decoder consisting of *args.decoder_layers* layers. Each layer
     is a :class:`TransformerDecoderLayer`.
-
     Args:
         args (argparse.Namespace): parsed command-line arguments
         dictionary (~fairseq.data.Dictionary): decoding dictionary
@@ -455,7 +441,6 @@ class TransformerDecoder(FairseqIncrementalDecoder):
         self.register_buffer('version', torch.Tensor([3]))
 
         self.dropout = args.dropout
-        self.decoder_layerdrop = args.decoder_layerdrop
         self.share_input_output_embed = args.share_decoder_input_output_embed
 
         input_embed_dim = embed_tokens.embedding_dim
@@ -526,7 +511,6 @@ class TransformerDecoder(FairseqIncrementalDecoder):
                 :ref:`Incremental decoding`
             features_only (bool, optional): only return features without
                 applying output layer (default: False).
-
         Returns:
             tuple:
                 - the decoder's output of shape `(batch, tgt_len, vocab)`
@@ -551,10 +535,8 @@ class TransformerDecoder(FairseqIncrementalDecoder):
     ):
         """
         Similar to *forward* but only return features.
-
         Includes several features from "Jointly Learning to Align and
         Translate with Transformer Models" (Garg et al., EMNLP 2019).
-
         Args:
             full_context_alignment (bool, optional): don't apply
                 auto-regressive mask to self-attention (default: False).
@@ -562,7 +544,6 @@ class TransformerDecoder(FairseqIncrementalDecoder):
                 heads at this layer (default: last layer).
             alignment_heads (int, optional): only average alignment over
                 this many heads (default: all heads).
-
         Returns:
             tuple:
                 - the decoder's features of shape `(batch, tgt_len, embed_dim)`
@@ -615,22 +596,20 @@ class TransformerDecoder(FairseqIncrementalDecoder):
             else:
                 self_attn_mask = None
 
-            # add LayerDrop (see https://arxiv.org/abs/1909.11556 for description)
-            dropout_probability = random.uniform(0, 1)
-            if not self.training or (dropout_probability > self.decoder_layerdrop):
-                x, layer_attn = layer(
-                    x,
-                    encoder_state,
-                    encoder_out['encoder_padding_mask'] if encoder_out is not None else None,
-                    incremental_state,
-                    self_attn_mask=self_attn_mask,
-                    self_attn_padding_mask=self_attn_padding_mask,
-                    need_attn=(idx == alignment_layer),
-                    need_head_weights=(idx == alignment_layer),
-                )
-                inner_states.append(x)
-                if layer_attn is not None and idx == alignment_layer:
-                    attn = layer_attn.float()
+            x, layer_attn = layer(
+                x,
+                encoder_state,
+                encoder_out['encoder_padding_mask'] if encoder_out is not None else None,
+                incremental_state,
+                self_attn_mask=self_attn_mask,
+                self_attn_padding_mask=self_attn_padding_mask,
+                need_attn=(idx == alignment_layer),
+                need_head_weights=(idx == alignment_layer),
+            )
+
+            inner_states.append(x)
+            if layer_attn is not None and idx == alignment_layer:
+                attn = layer_attn.float()
 
         if attn is not None:
             if alignment_heads is not None:
@@ -680,6 +659,12 @@ class TransformerDecoder(FairseqIncrementalDecoder):
 
     def upgrade_state_dict_named(self, state_dict, name):
         """Upgrade a (possibly old) state dict for new versions of fairseq."""
+        # Keep the current weights for the encoder embedding table
+        if self.upgrade_tgt_dict:
+            for k in state_dict.keys():
+                if 'decoder.embed_tokens' in k:
+                    state_dict[k] = self.embed_tokens.weight
+
         if isinstance(self.embed_positions, SinusoidalPositionalEmbedding):
             weights_key = '{}.embed_positions.weights'.format(name)
             if weights_key in state_dict:
